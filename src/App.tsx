@@ -30,6 +30,51 @@ export default function App() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const requestRef = useRef<number>(null);
+
+  const drawVisualizer = () => {
+    if (!analyserRef.current || !canvasRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const analyser = analyserRef.current;
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    analyser.getByteTimeDomainData(dataArray);
+
+    ctx.fillStyle = 'rgba(10, 10, 10, 0.4)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#10b981'; // emerald-500
+    ctx.beginPath();
+
+    const sliceWidth = canvas.width * 1.0 / bufferLength;
+    let x = 0;
+
+    for (let i = 0; i < bufferLength; i++) {
+      const v = dataArray[i] / 128.0;
+      const y = v * canvas.height / 2;
+
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+      x += sliceWidth;
+    }
+
+    ctx.lineTo(canvas.width, canvas.height / 2);
+    ctx.stroke();
+
+    if (isListening) {
+      requestRef.current = requestAnimationFrame(drawVisualizer);
+    }
+  };
 
   const toggleMic = async () => {
     if (isListening) {
@@ -44,16 +89,27 @@ export default function App() {
       setError(null);
       
       // Request mic permissions
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        } 
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          } 
+        });
+      } catch (err) {
+        console.warn("Specific constraints failed, trying default audio...", err);
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       
       const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioContextCtor();
+      
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      
       const source = ctx.createMediaStreamSource(stream);
 
       // Izolacja częstotliwości (Według zaleceń inżynieryjnych: 300 Hz - 3400 Hz dla głosu)
@@ -62,31 +118,58 @@ export default function App() {
       const highpass = ctx.createBiquadFilter();
       highpass.type = 'highpass';
       highpass.frequency.value = 300;
-      highpass.Q.value = 1;
+      highpass.Q.value = 0.707;
 
       // Filtr Lowpass - odcina syczenie i wysokie szumy > 3400Hz
       const lowpass = ctx.createBiquadFilter();
       lowpass.type = 'lowpass';
       lowpass.frequency.value = 3400;
-      lowpass.Q.value = 1;
+      lowpass.Q.value = 0.707;
 
       // Wzmocnienie sygnału
       const gainNode = ctx.createGain();
       gainNode.gain.value = gainLevel;
       gainNodeRef.current = gainNode;
+      
+      // Analizator dla wizualizacji (opcjonalnie)
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      analyserRef.current = analyser;
 
       // Łączenie węzłów
       source.connect(highpass);
       highpass.connect(lowpass);
       lowpass.connect(gainNode);
-      gainNode.connect(ctx.destination);
+      gainNode.connect(analyser); // wizualizacja
+      analyser.connect(ctx.destination);
 
       audioCtxRef.current = ctx;
       streamRef.current = stream;
       setIsListening(true);
+      
+      // Rozpocznij rysowanie
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      requestRef.current = requestAnimationFrame(drawVisualizer);
     } catch (err: any) {
       console.error(err);
-      setError("Nie udało się uzyskać dostępu do mikrofonu. Upewnij się, że nadałeś uprawnienia.");
+      
+      let errorMessage = "Wystąpił nieoczekiwany błąd podczas dostępu do mikrofonu.";
+      
+      if (err.name === 'NotAllowedError') {
+        errorMessage = "Brak uprawnień. Przeglądarka zablokowała dostęp do mikrofonu. Zezwól na dostęp w ustawieniach przeglądarki.";
+      } else if (err.name === 'NotFoundError') {
+        errorMessage = "Nie znaleziono mikrofonu. Upewnij się, że mikrofon jest podłączony i aktywny.";
+      } else if (err.name === 'NotReadableError') {
+        errorMessage = "Mikrofon jest używany przez inną aplikację lub wystąpił błąd sprzętowy.";
+      } else if (err.name === 'OverconstrainedError') {
+        errorMessage = "Nie udało się spełnić wymagań sprzętowych urządzenia audio.";
+      } else if (err.name === 'NotSupportedError') {
+         errorMessage = "Twoja przeglądarka nie obsługuje wymaganych funkcji Audio.";
+      } else if (err.message) {
+        errorMessage = `Błąd: ${err.message}`;
+      }
+
+      setError(errorMessage);
     }
   };
 
@@ -98,6 +181,9 @@ export default function App() {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
+    }
+    if (requestRef.current) {
+      cancelAnimationFrame(requestRef.current);
     }
     setIsListening(false);
   };
@@ -165,23 +251,42 @@ export default function App() {
               <div className="bg-emerald-950/30 border border-emerald-900/50 p-6 rounded-2xl">
                 <h2 className="text-xl font-bold text-white mb-2">Symulacja Przetwarzania W Locie</h2>
                 <p className="text-emerald-200/70 text-sm max-w-3xl leading-relaxed">
-                  Zgodnie z koncepcją, poniższe narzędzie symuluje "Izolację Częstotliwości". Pobiera dźwięk z mikrofonu Twojego urządzenia, aplikuje pasmowo-przepustowy filtr ograniczający szum $300\text{ Hz}$ do $3400\text{ Hz}$ (częstotliwości ludzkiego głosu) i wzmacnia go.
+                  Zgodnie z koncepcją, poniższe narzędzie symuluje "Izolację Częstotliwości". Pobiera dźwięk z mikrofonu Twojego urządzenia, aplikuje pasmowo-przepustowy filtr ograniczający szum 300 Hz do 3400 Hz (częstotliwości ludzkiego głosu) i wzmacnia go.
                 </p>
                 
-                <div className="mt-6 flex items-start gap-4 bg-orange-950/50 border border-orange-900/50 p-4 rounded-xl">
-                  <AlertTriangle className="w-6 h-6 text-orange-500 shrink-0 mt-0.5" />
-                  <div>
-                    <h3 className="text-orange-400 font-bold text-sm">OSTRZEŻENIE O SPRZĘŻENIU (FEEDBACK LOOP)</h3>
-                    <p className="text-orange-300/80 text-xs mt-1">
-                      Nie włączaj tej funkcji używając głośników komputerowych. Dźwięk mikrofonu wyjdzie na głośniki i wejdzie z powrotem do mikrofonu niszcząc Ci słuch. <strong>ZAŁÓŻ SŁUCHAWKI PRZED URUCHOMIENIEM!</strong>
-                    </p>
+                <div className="mt-6 flex flex-col gap-3">
+                  <div className="flex items-start gap-4 bg-orange-950/50 border border-orange-900/50 p-4 rounded-xl">
+                    <AlertTriangle className="w-6 h-6 text-orange-500 shrink-0 mt-0.5" />
+                    <div>
+                      <h3 className="text-orange-400 font-bold text-sm">OSTRZEŻENIE O SPRZĘŻENIU (FEEDBACK LOOP)</h3>
+                      <p className="text-orange-300/80 text-xs mt-1">
+                        Nie włączaj tej funkcji używając głośników komputerowych. Dźwięk mikrofonu wyjdzie na głośniki i wejdzie z powrotem do mikrofonu niszcząc Ci słuch. <strong>ZAŁÓŻ SŁUCHAWKI PRZED URUCHOMIENIEM!</strong>
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-4 bg-blue-950/50 border border-blue-900/50 p-4 rounded-xl">
+                    <Headphones className="w-6 h-6 text-blue-500 shrink-0 mt-0.5" />
+                    <div className="space-y-2">
+                      <h3 className="text-blue-400 font-bold text-sm">Masz Bluetooth i słyszysz pikanie / spadek jakości? (A2DP vs HFP)</h3>
+                      <p className="text-blue-300/80 text-sm">
+                        Wybór profilu Bluetooth (widoczny na Twoim zrzucie ekranu) to klucz do problemu:
+                      </p>
+                      <ul className="text-blue-300/80 text-xs list-disc pl-4 space-y-1">
+                        <li><strong>A2DP (np. kodek AAC/SBC)</strong>: Wysoka jakość dźwięku, ale <strong>tylko odtwarzanie (jednokierunkowe)</strong>. Słuchawki nie udostępniają wtedy mikrofonu.</li>
+                        <li><strong>HSP/HFP (np. kodek mSBC/CVSD)</strong>: Obsługa mikrofonu w słuchawkach, ale za to <strong>drastyczny spadek jakości dźwięku</strong> (tzw. "jakość rozmowy telefonicznej").</li>
+                      </ul>
+                      <p className="text-blue-300/80 text-xs mt-2 border-t border-blue-900/50 pt-2">
+                        <strong>Rozwiązanie:</strong> Pikanie ("bip bip") to moment, w którym sprzęt zrywa połączenie muzyczne by przejść w tryb rozmowy HSP/HFP (bo przeglądarka zażądała mikrofonu). 
+                        Aby to obejść i zachować jakość: zostaw profil słuchawek na <strong>Odtwarzanie o wysokiej dokładności (A2DP, AAC)</strong>, ale w ustawieniach "Wejścia" / "Nagrywania" w systemie wymuś <strong>mikrofon wbudowany w laptopa</strong> (lub podłączony po USB). Nasz koncept zakłada i tak użycie zewnętrznego mikrofonu (kierunkowego z telefonu/laptopa), więc to idealnie pasuje!
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>
 
               <div className="grid md:grid-cols-2 gap-8">
                 {/* Control Panel */}
-                <div className="bg-neutral-900 rounded-2xl border border-neutral-800 p-8 flex flex-col items-center justify-center min-h-[300px]">
+                <div className="bg-neutral-900 rounded-2xl border border-neutral-800 p-8 flex flex-col items-center justify-center min-h-[350px]">
                   <button
                     onClick={toggleMic}
                     className={cn(
@@ -197,9 +302,17 @@ export default function App() {
                     
                     {isListening ? <Square className="w-12 h-12 fill-current" /> : <Play className="w-12 h-12 fill-current ml-2" />}
                   </button>
-                  <p className="mt-8 text-neutral-400 font-medium font-sans">
+                  <p className="mt-8 text-neutral-400 font-medium font-sans mb-4">
                     {isListening ? "PRZETWARZANIE AKTYWNE" : "URUCHOM SYMULATOR"}
                   </p>
+                  
+                  <div className="w-full h-16 bg-neutral-950 rounded-lg overflow-hidden border border-neutral-800 relative">
+                    {!isListening && (
+                      <div className="absolute inset-0 flex items-center justify-center text-xs text-neutral-600">Oczekiwanie na sygnał audio</div>
+                    )}
+                    <canvas ref={canvasRef} className="w-full h-full" width={300} height={64} />
+                  </div>
+
                   {error && <p className="text-red-400 text-sm mt-4 text-center">{error}</p>}
                 </div>
 
