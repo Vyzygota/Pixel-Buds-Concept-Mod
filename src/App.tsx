@@ -25,14 +25,46 @@ export default function App() {
   // Audio Simulator State
   const [isListening, setIsListening] = useState(false);
   const [gainLevel, setGainLevel] = useState(2.0); // Wzmocnienie domyślne: 2x
+  const [useAEC, setUseAEC] = useState(true); // Ochrona przed sprzężeniem domyślnie włączona
   const [error, setError] = useState<string | null>(null);
   
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  
+  type EQPreset = 'voice-clarity' | 'noise-reduction' | 'full-spectrum';
+  const [eqPreset, setEqPreset] = useState<EQPreset>('voice-clarity');
+
+  const PRESETS = {
+    'voice-clarity': { name: 'Voice Clarity (Wydobycie mowy z tła)', hp: 300, lp: 2800, eqFreq: 1200, eqGain: 4, compRatio: 12, compThresh: -45 },
+    'noise-reduction': { name: 'Noise Reduction (Silne tłumienie szumów)', hp: 400, lp: 2000, eqFreq: 1000, eqGain: 2, compRatio: 20, compThresh: -50 },
+    'full-spectrum': { name: 'Full Spectrum (Pełny zakres / muzyka)', hp: 50, lp: 8000, eqFreq: 2000, eqGain: 0, compRatio: 4, compThresh: -35 }
+  };
+
   const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const filtersRef = useRef<{ highpass: BiquadFilterNode; lowpass: BiquadFilterNode; eq: BiquadFilterNode; compressor: DynamicsCompressorNode } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const requestRef = useRef<number>(null);
+
+  useEffect(() => {
+    // Enum devices to prevent 'Monitor' loop
+    const getDevices = async () => {
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true }); // Request perm to get labels
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(device => device.kind === 'audioinput');
+        setAudioDevices(audioInputs);
+        if (audioInputs.length > 0) {
+          setSelectedDeviceId(audioInputs[0].deviceId);
+        }
+      } catch (err) {
+        console.error("Nie udało się pobrać listy urządzeń.", err);
+      }
+    };
+    getDevices();
+  }, []);
 
   const drawVisualizer = () => {
     if (!analyserRef.current || !canvasRef.current) return;
@@ -91,12 +123,18 @@ export default function App() {
       // Request mic permissions
       let stream: MediaStream;
       try {
+        const constraints: MediaTrackConstraints = {
+          echoCancellation: useAEC,
+          noiseSuppression: useAEC,
+          autoGainControl: false,
+        };
+        
+        if (selectedDeviceId) {
+          constraints.deviceId = { exact: selectedDeviceId };
+        }
+
         stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-          } 
+          audio: constraints 
         });
       } catch (err) {
         console.warn("Specific constraints failed, trying default audio...", err);
@@ -104,7 +142,7 @@ export default function App() {
       }
       
       const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioContextCtor();
+      const ctx = new AudioContextCtor({ latencyHint: 'interactive' });
       
       if (ctx.state === 'suspended') {
         await ctx.resume();
@@ -114,17 +152,36 @@ export default function App() {
 
       // Izolacja częstotliwości (Według zaleceń inżynieryjnych: 300 Hz - 3400 Hz dla głosu)
       
-      // Filtr Highpass - odcina ryczenie i niskie dudnienie < 300Hz
+      const p = PRESETS[eqPreset];
+      
+      // Filtr Highpass - odcina ryczenie i niskie dudnienie
       const highpass = ctx.createBiquadFilter();
       highpass.type = 'highpass';
-      highpass.frequency.value = 300;
+      highpass.frequency.value = p.hp;
       highpass.Q.value = 0.707;
 
-      // Filtr Lowpass - odcina syczenie i wysokie szumy > 3400Hz
+      // Filtr Lowpass - odcina syczenie i wysokie szumy
       const lowpass = ctx.createBiquadFilter();
       lowpass.type = 'lowpass';
-      lowpass.frequency.value = 3400;
+      lowpass.frequency.value = p.lp;
       lowpass.Q.value = 0.707;
+
+      // Peaking EQ - wzmocnienie "prezencji" Głosu (lepsze wybijanie się z szumu)
+      const presenceEQ = ctx.createBiquadFilter();
+      presenceEQ.type = 'peaking';
+      presenceEQ.frequency.value = p.eqFreq;
+      presenceEQ.Q.value = 1.0;
+      presenceEQ.gain.value = p.eqGain;
+
+      // Kompresor dynamiki - wyrównuje głośność, wyciąga ciche dźwięki i spłaszcza głośne
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = p.compThresh;
+      compressor.knee.value = 30;
+      compressor.ratio.value = p.compRatio;
+      compressor.attack.value = 0.01; // Szybki atak
+      compressor.release.value = 0.25;
+      
+      filtersRef.current = { highpass, lowpass, eq: presenceEQ, compressor };
 
       // Wzmocnienie sygnału
       const gainNode = ctx.createGain();
@@ -136,10 +193,12 @@ export default function App() {
       analyser.fftSize = 256;
       analyserRef.current = analyser;
 
-      // Łączenie węzłów
+      // Łączenie węzłów (Łańcuch DSP: source -> highpass -> lowpass -> EQ -> compressor -> gain -> analyser -> destination)
       source.connect(highpass);
       highpass.connect(lowpass);
-      lowpass.connect(gainNode);
+      lowpass.connect(presenceEQ);
+      presenceEQ.connect(compressor);
+      compressor.connect(gainNode);
       gainNode.connect(analyser); // wizualizacja
       analyser.connect(ctx.destination);
 
@@ -182,6 +241,7 @@ export default function App() {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
+    filtersRef.current = null;
     if (requestRef.current) {
       cancelAnimationFrame(requestRef.current);
     }
@@ -194,6 +254,20 @@ export default function App() {
       gainNodeRef.current.gain.setTargetAtTime(gainLevel, audioCtxRef.current.currentTime, 0.05);
     }
   }, [gainLevel]);
+
+  // Zaktualizuj parametry DSP dynamicznie przy zmianie profilu
+  useEffect(() => {
+    if (filtersRef.current && audioCtxRef.current) {
+      const p = PRESETS[eqPreset];
+      const t = audioCtxRef.current.currentTime;
+      filtersRef.current.highpass.frequency.setTargetAtTime(p.hp, t, 0.1);
+      filtersRef.current.lowpass.frequency.setTargetAtTime(p.lp, t, 0.1);
+      filtersRef.current.eq.frequency.setTargetAtTime(p.eqFreq, t, 0.1);
+      filtersRef.current.eq.gain.setTargetAtTime(p.eqGain, t, 0.1);
+      filtersRef.current.compressor.threshold.setTargetAtTime(p.compThresh, t, 0.1);
+      filtersRef.current.compressor.ratio.setTargetAtTime(p.compRatio, t, 0.1);
+    }
+  }, [eqPreset]);
 
   // Clean up na wyjściu
   useEffect(() => {
@@ -249,19 +323,42 @@ export default function App() {
               className="space-y-8"
             >
               <div className="bg-emerald-950/30 border border-emerald-900/50 p-6 rounded-2xl">
-                <h2 className="text-xl font-bold text-white mb-2">Symulacja Przetwarzania W Locie</h2>
+                <h2 className="text-xl font-bold text-white mb-2">Symulacja Przetwarzania W Locie (DSP Audio Pipeline)</h2>
                 <p className="text-emerald-200/70 text-sm max-w-3xl leading-relaxed">
-                  Zgodnie z koncepcją, poniższe narzędzie symuluje "Izolację Częstotliwości". Pobiera dźwięk z mikrofonu Twojego urządzenia, aplikuje pasmowo-przepustowy filtr ograniczający szum 300 Hz do 3400 Hz (częstotliwości ludzkiego głosu) i wzmacnia go.
+                  Zaktualizowany łańcuch filtrujący symuluje "Izolację Tła". Pobiera dźwięk z mikrofonu Twojego urządzenia, następnie aplikuje kolejno: 
+                  <strong>(1)</strong> filtr pasmowy 300Hz-3400Hz (odcina buczenie i syk), 
+                  <strong>(2)</strong> filtr Peaking EQ wzmacniający częstotliwości 1500Hz (tam gdzie ludzki głos jest najbardziej czytelny), 
+                  <strong>(3)</strong> Kompresor Dynamiki wyciągający najcichsze tony i spłaszczający głośne hałasy, oraz 
+                  <strong>(4)</strong> silne Wzmocnienie (Gain) podbijające ostateczny efekt bez przesteru.
                 </p>
                 
                 <div className="mt-6 flex flex-col gap-3">
                   <div className="flex items-start gap-4 bg-orange-950/50 border border-orange-900/50 p-4 rounded-xl">
                     <AlertTriangle className="w-6 h-6 text-orange-500 shrink-0 mt-0.5" />
-                    <div>
-                      <h3 className="text-orange-400 font-bold text-sm">OSTRZEŻENIE O SPRZĘŻENIU (FEEDBACK LOOP)</h3>
+                    <div className="space-y-2">
+                      <h3 className="text-orange-400 font-bold text-sm">"Monitor of..." Pętla Sprzętowa (Piszczenie w Linuksie!)</h3>
                       <p className="text-orange-300/80 text-xs mt-1">
-                        Nie włączaj tej funkcji używając głośników komputerowych. Dźwięk mikrofonu wyjdzie na głośniki i wejdzie z powrotem do mikrofonu niszcząc Ci słuch. <strong>ZAŁÓŻ SŁUCHAWKI PRZED URUCHOMIENIEM!</strong>
+                        Jeśli sprzężenie błyskawicznie narasta do pisku, oznacza to, że przeglądarka zamiast fizycznego mikrofonu z laptopa przechwytuje tzw. <strong>"Monitor of WH-1000XM4"</strong> (lub podobny). W systemach Linux (PipeWire / PulseAudio) "Monitor" to wirtualny mikrofon, który nagrywa to, co leci na słuchawki. W efekcie program w nieskończoność sam nasłuchuje własnego wyjścia tworząc natychmiastowe sprzężenie zwrotne.
                       </p>
+                      <ul className="text-orange-300/80 text-xs list-disc pl-4 space-y-1 mt-2">
+                        <li><strong>ROZWIĄZANIE NAJWAŻNIEJSZE:</strong> Użyj rozwijanej listy poniżej (w głównym panelu) i wybierz fizyczny mikrofon z laptopa (np. <i>Ryzen HD Audio Controller</i>), a NIE opcji typu "Monitor of...".</li>
+                        <li>Sprawdź też w ustawieniach "Dźwięku", by domyślnym wejściem była karta sprzętowa.</li>
+                      </ul>
+                      <div className="mt-3 pt-3 border-t border-orange-900/50 flex items-center justify-between">
+                        <span className="text-sm font-bold text-orange-400">Tłumienie sprzężeń (AEC)</span>
+                        <button 
+                          onClick={() => {
+                            setUseAEC(!useAEC);
+                            if (isListening) {
+                              stopAudio(); // wymusza restart by zaaplikować nowe ustawienia
+                              setTimeout(() => alert("Kliknij 'Play', aby uruchomić ponownie ze zmienionym trybem AEC."), 300);
+                            }
+                          }}
+                          className={cn("px-3 py-1 rounded text-xs font-bold transition-colors", useAEC ? "bg-emerald-500/20 text-emerald-400" : "bg-neutral-800 text-neutral-400")}
+                        >
+                          {useAEC ? "WŁĄCZONE" : "WYŁĄCZONE"}
+                        </button>
+                      </div>
                     </div>
                   </div>
                   <div className="flex items-start gap-4 bg-blue-950/50 border border-blue-900/50 p-4 rounded-xl">
@@ -306,6 +403,29 @@ export default function App() {
                     {isListening ? "PRZETWARZANIE AKTYWNE" : "URUCHOM SYMULATOR"}
                   </p>
                   
+                  {/* Przełącznik urządzeń */}
+                  <div className="w-full mb-6">
+                    <label className="block text-xs font-bold text-neutral-500 mb-2">WYBIERZ MIKROFON (Omiń Pętlę "Monitor of..."):</label>
+                    <select 
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-300 text-sm rounded-lg p-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
+                      value={selectedDeviceId}
+                      onChange={(e) => {
+                        setSelectedDeviceId(e.target.value);
+                        if (isListening) {
+                          stopAudio();
+                          setTimeout(() => alert("Wybrałeś inny mikrofon. Uruchom ponownie przyciskiem Play."), 200);
+                        }
+                      }}
+                    >
+                      {audioDevices.length === 0 && <option value="">Zezwól na mikrofon by załadować listę...</option>}
+                      {audioDevices.map(device => (
+                        <option key={device.deviceId} value={device.deviceId}>
+                          {device.label || `Mikrofon / Wejście ${device.deviceId.substring(0,6)}...`}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  
                   <div className="w-full h-16 bg-neutral-950 rounded-lg overflow-hidden border border-neutral-800 relative">
                     {!isListening && (
                       <div className="absolute inset-0 flex items-center justify-center text-xs text-neutral-600">Oczekiwanie na sygnał audio</div>
@@ -319,46 +439,83 @@ export default function App() {
                 {/* Settings Panel */}
                 <div className="bg-neutral-900 rounded-2xl border border-neutral-800 p-8 space-y-8">
                   <div className="flex items-center gap-3 text-white font-bold pb-4 border-b border-neutral-800">
-                    <Settings2 className="w-5 h-5 text-neutral-400" /> Parametry filtru DSP
+                    <Settings2 className="w-5 h-5 text-neutral-400" /> Profil Przetwarzania (DSP Preset)
                   </div>
                   
+                  {/* Przełącznik Profilu EQ */}
+                  <div className="w-full">
+                    <select 
+                      className="w-full bg-neutral-950 border border-neutral-700 text-emerald-400 font-medium text-sm rounded-lg p-3 focus:ring-emerald-500 focus:border-emerald-500 outline-none transition-all"
+                      value={eqPreset}
+                      onChange={(e) => setEqPreset(e.target.value as EQPreset)}
+                    >
+                      {Object.entries(PRESETS).map(([key, data]) => (
+                        <option key={key} value={key}>
+                          {data.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
                   <div className="space-y-4">
                     <div className="flex justify-between text-sm">
-                      <span className="text-neutral-400">Filtr górnoprzepustowy (High-pass)</span>
-                      <span className="text-emerald-400 font-bold">300 Hz</span>
+                      <span className="text-neutral-400">High-pass / Low-pass (Cutoff)</span>
+                      <span className="text-emerald-400 font-bold">{PRESETS[eqPreset].hp}Hz - {(PRESETS[eqPreset].lp / 1000).toFixed(1)}kHz</span>
                     </div>
-                    <div className="h-2 w-full bg-neutral-800 rounded-full overflow-hidden">
-                      <div className="h-full bg-emerald-500/30 w-full rounded-full"></div>
+                    <div className="h-2 w-full bg-neutral-800 rounded-full overflow-hidden flex">
+                      <div className="bg-neutral-800/10 h-full transition-all duration-300" style={{ width: `${(PRESETS[eqPreset].hp / 500) * 15}%` }}></div>
+                      <div className="bg-emerald-500/30 h-full rounded-full transition-all duration-300" style={{ flex: 1 }}></div>
+                      <div className="bg-neutral-800/10 h-full transition-all duration-300" style={{ width: `${Math.max(0, 100 - (PRESETS[eqPreset].lp / 8000) * 100)}%` }}></div>
                     </div>
                   </div>
 
                   <div className="space-y-4">
                     <div className="flex justify-between text-sm">
-                      <span className="text-neutral-400">Filtr dolnoprzepustowy (Low-pass)</span>
-                      <span className="text-emerald-400 font-bold">3400 Hz</span>
+                      <span className="text-neutral-400">Peaking EQ (Prezencja / Wokal)</span>
+                      <span className="text-emerald-400 font-bold">{PRESETS[eqPreset].eqFreq} Hz ({PRESETS[eqPreset].eqGain > 0 ? '+' : ''}{PRESETS[eqPreset].eqGain}dB)</span>
                     </div>
-                    <div className="h-2 w-full bg-neutral-800 rounded-full overflow-hidden">
-                      <div className="h-full bg-emerald-500/30 w-full rounded-full"></div>
+                    <div className="h-2 w-full bg-neutral-800 rounded-full overflow-hidden relative">
+                      <div className="absolute inset-0 bg-neutral-800"></div>
+                      <div 
+                        className="absolute bg-emerald-400 h-full rounded-full blur-[1px] transition-all duration-300" 
+                        style={{ 
+                          left: `${(PRESETS[eqPreset].eqFreq / 4000) * 100}%`, 
+                          width: '20%', 
+                          opacity: PRESETS[eqPreset].eqGain > 0 ? 1 : 0.2 
+                        }}
+                      ></div>
                     </div>
                   </div>
 
-                  <div className="space-y-4 pt-4">
+                  <div className="space-y-4">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-neutral-400">Kompresor Dynamiki (Zrównanie)</span>
+                      <span className="text-emerald-400 font-bold">Ratio {PRESETS[eqPreset].compRatio}:1</span>
+                    </div>
+                    <div className="h-2 w-full bg-neutral-800 rounded-full overflow-hidden relative">
+                      <div className="h-full bg-blue-500/50 rounded-full opacity-80 transition-all duration-300" style={{ width: `${(PRESETS[eqPreset].compRatio / 25) * 100}%` }}></div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4 pt-4 border-t border-neutral-800 mt-4">
                     <div className="flex justify-between items-center text-sm mb-2">
                       <span className="flex items-center gap-2 text-neutral-400">
-                        <Volume2 className="w-4 h-4" /> Wzmocnienie wokalu (Gain)
+                        <Volume2 className="w-4 h-4" /> Główne wzmocnienie (Gain Boost)
                       </span>
                       <span className="text-emerald-400 font-bold">{gainLevel.toFixed(1)}x</span>
                     </div>
                     <input 
                       type="range" 
                       min="1" 
-                      max="5" 
-                      step="0.1" 
+                      max="20" 
+                      step="0.5" 
                       value={gainLevel}
                       onChange={(e) => setGainLevel(parseFloat(e.target.value))}
                       className="w-full accent-emerald-500 bg-neutral-800 rounded-lg appearance-none h-2"
                     />
-                    <p className="text-xs text-neutral-500 italic mt-2">Działa w czasie rzeczywistym. Dostosuj głośność mowy.</p>
+                    <p className="text-xs text-neutral-500 italic mt-2">
+                      Dzięki nowemu kompresorowi i EQ możesz znacznie silniej podbić głośność bez całkowitego przesterowania.
+                    </p>
                   </div>
                 </div>
               </div>
