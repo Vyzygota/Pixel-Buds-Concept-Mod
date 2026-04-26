@@ -1,0 +1,8 @@
+{
+  "name": "Pixel Buds Concept Mod",
+  "description": "Koncepcja i symulacja funkcji Conversation Boost dla słuchawek na bazie Androida i Web Audio API.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": []
+}
